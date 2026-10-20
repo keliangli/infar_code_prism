@@ -1,7 +1,8 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import {
-  buildIndex, fileOffset, formatK, heightForLoc, layoutDistricts, neighborsFor, orderDistrictFiles, searchFiles
+  buildIndex, fileOffset, formatK, heightForLoc, layoutDistricts, layoutFloors, neighborsFor, orderDistrictFiles,
+  searchFiles, symbolNeighbors
 } from '../src/derive.js';
 
 const graph = {
@@ -87,4 +88,34 @@ test('district files are grouped by sub directory then by size', () => {
   });
   const order = orderDistrictFiles(graph.districts[0], index.filesById);
   assert.deepEqual(order, ['managers/b.py', 'managers/scheduler.py']);
+});
+
+const symbols = [
+  { id: 'f.py#b', name: 'b', kind: 'method', start: 60, end: 90, loc: 30, calls: ['a', 'A'] },
+  { id: 'f.py#A', name: 'A', kind: 'class', start: 10, end: 50, loc: 40, calls: ['a', 'missing'] },
+  { id: 'f.py#a', name: 'a', kind: 'function', start: 30, end: 45, loc: 15, calls: [] }
+];
+
+test('symbol floors stack bottom-up and keep the building height', () => {
+  const file = { loc: 400, symbols };
+  const { floors, totalHeight } = layoutFloors(file, 10000);
+  assert.deepEqual(layoutFloors({ loc: 400 }, 10000).floors, []);
+  assert.deepEqual(floors.map(floor => floor.name), ['A', 'a', 'b']);
+  assert.equal(floors[0].y0, 0);
+  assert.equal(totalHeight, heightForLoc(400, 10000));
+  assert.ok(Math.abs(floors[floors.length - 1].y1 - totalHeight) < 1e-9);
+  assert.ok(floors[0].y0 < floors[1].y0 && floors[1].y0 < floors[2].y0);
+  // 层高与 log10(loc) 成正比：log10(31) / log10(16)
+  const ratio = floors[2].height / floors[1].height;
+  assert.ok(Math.abs(ratio - Math.log10(31) / Math.log10(16)) < 1e-9);
+  assert.equal(new Set(floors.map(floor => floor.color)).size, 3);
+});
+
+test('symbol neighbors resolve calls by same file symbol name', () => {
+  const file = { symbols };
+  const incoming = symbolNeighbors(file, 'f.py#a');
+  assert.deepEqual(incoming.out, []);
+  assert.deepEqual(incoming.in.map(item => item.id), ['f.py#A', 'f.py#b']);
+  assert.deepEqual(symbolNeighbors(file, 'f.py#b').out.map(item => item.id), ['f.py#A', 'f.py#a']);
+  assert.deepEqual(symbolNeighbors(file, 'f.py#a').in.map(item => item.name), ['A', 'b']);
 });

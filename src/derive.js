@@ -122,6 +122,64 @@ export function neighborsFor(index, kind, id, limit = 10) {
   return { out: (outMap.get(id) || []).slice(0, limit), in: (inMap.get(id) || []).slice(0, limit) };
 }
 
+// 文件内部的符号配色：类 / 函数 / 方法三色，刻意与依赖连线的青、紫区分开。
+export const SYMBOL_COLORS = { class: '#f2b661', function: '#7fd8a5', method: '#8fa9ff' };
+
+export function symbolColor(kind) {
+  return SYMBOL_COLORS[kind] || '#8fa8d8';
+}
+
+// 符号顺序：自下而上按起始行升序，同起点时用名字做稳定次序。
+export function orderSymbols(symbols) {
+  return [...(symbols || [])].sort((a, b) => (a.start - b.start) || (a.name < b.name ? -1 : 1));
+}
+
+// 内部视图的楼层堆叠：一个符号一层，层高 ∝ log10(行数+1)，归一化后总高
+// 与城市视图里那栋楼的高度完全一致（同一 heightForLoc 口径）。
+export function layoutFloors(file, maxLoc) {
+  const totalHeight = heightForLoc(file?.loc, maxLoc);
+  const symbols = orderSymbols(file?.symbols);
+  const weights = symbols.map(symbol => Math.log10(Math.max(1, symbol.loc || 0) + 1));
+  const sum = weights.reduce((acc, weight) => acc + weight, 0);
+  const floors = [];
+  let y = 0;
+  symbols.forEach((symbol, i) => {
+    const height = totalHeight * (sum > 0 ? weights[i] / sum : 1 / symbols.length);
+    floors.push({
+      id: symbol.id, name: symbol.name, kind: symbol.kind,
+      start: symbol.start, end: symbol.end, loc: symbol.loc,
+      color: symbolColor(symbol.kind), height, y0: y, y1: y + height
+    });
+    y += height;
+  });
+  return { floors, totalHeight, top: y };
+}
+
+// 符号内调用邻居：calls 只带同文件符号名，这里映射回符号 id。
+// 同名符号（不同类里的同名方法）按起始行取第一个，属于抽取口径下的近似。
+export function symbolNeighbors(file, symbolId) {
+  const symbols = file?.symbols || [];
+  const byName = new Map(), byId = new Map();
+  for (const symbol of orderSymbols(symbols)) {
+    byId.set(symbol.id, symbol);
+    if (!byName.has(symbol.name)) byName.set(symbol.name, symbol);
+  }
+  const outMap = new Map(), inMap = new Map();
+  for (const symbol of symbols) {
+    for (const name of symbol.calls || []) {
+      const target = byName.get(name);
+      if (!target || target.id === symbol.id) continue;
+      if (!outMap.has(symbol.id)) outMap.set(symbol.id, new Set());
+      outMap.get(symbol.id).add(target.id);
+      if (!inMap.has(target.id)) inMap.set(target.id, new Set());
+      inMap.get(target.id).add(symbol.id);
+    }
+  }
+  const describe = id => ({ id, name: byId.get(id)?.name || id, kind: byId.get(id)?.kind });
+  const collect = map => [...(map.get(symbolId) || [])].map(describe).sort((a, b) => (a.name < b.name ? -1 : 1));
+  return { out: collect(outMap), in: collect(inMap) };
+}
+
 // 搜索：按路径子串匹配，命中优先给出行数更大的文件。
 export function searchFiles(graph, keyword, limit = 12) {
   const needle = String(keyword || '').trim().toLowerCase();

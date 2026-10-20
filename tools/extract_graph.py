@@ -25,6 +25,10 @@ Counting rules (approximate by intent, kept simple & reproducible)
 * ``defs``         : every ``FunctionDef`` / ``AsyncFunctionDef`` node found by
                      ``ast.walk`` (i.e. methods and nested functions included).
 * ``classes``      : every ``ClassDef`` node found by ``ast.walk``.
+* ``symbols``      : file-internal structure for the "drill-down" view: top-level
+                     classes / functions plus one-level methods (see
+                     :func:`collect_symbols`).  ``symbolTotal``/``symbolEdgeTotal``
+                     aggregate symbol counts and intra-file call edges.
 * ``fanOut`` (file): number of *distinct* internal target files imported.
 * ``fanIn``  (file): number of *distinct* internal source files importing it.
 * ``weight``       : how many times the same ``from -> to`` pair occurs
@@ -40,6 +44,12 @@ importing file's package directory.  A target resolves only when it exists insid
 the root as ``<pkg>.py`` or ``<pkg>/__init__.py``; anything else (third-party,
 dynamic, ``try/except`` fallbacks, ``sglang``-only prefixes) is ignored and just
 counted as ``meta.unresolvedImports``.
+* ``from pkg import name``: when ``pkg`` is a package, each ``name`` is first
+  tried as a submodule (``pkg/name.py``); resolved names edge to the submodule
+  instead of the package ``__init__``.  When no name resolves, the statement
+  keeps its package/module edge (the names are then symbols defined there).
+* Files that fail to parse (``SyntaxError``) are counted in ``meta.parseErrors``
+  instead of silently contributing zero metrics.
 """
 
 from __future__ import annotations
@@ -47,13 +57,24 @@ from __future__ import annotations
 import argparse
 import ast
 import json
+import os
 import sys
+import warnings
 from collections import defaultdict
 from datetime import datetime, timezone
 from pathlib import Path
 
-# Prefix that absolute SGLang imports use to reach the analysed root.
-SRT_PREFIX = "sglang.srt"
+# Default prefix that absolute imports use to reach the analysed root.
+# Override with --prefix to point the extractor at another package tree.
+DEFAULT_PREFIX = "sglang.srt"
+
+# Default source root: env var first (portable), this machine checkout as fallback.
+DEFAULT_ROOT = os.environ.get(
+    "SGLANG_SRT_ROOT", r"D:\code\sglang\sglang-main\python\sglang\srt"
+)
+
+# Extraction output always lives inside the repo by default.
+DEFAULT_OUT = Path(__file__).resolve().parent.parent / "data" / "sglang-graph.json"
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -79,12 +100,119 @@ def count_code_lines(text: str) -> int:
     return n
 
 
+def _called_name(call: ast.Call):
+    """Best-effort bare name of the callee of *call* (``None`` if not nameable)."""
+    func = call.func
+    if isinstance(func, ast.Name):
+        return func.id            # foo(...)
+    if isinstance(func, ast.Attribute):
+        return func.attr          # self.foo(...) / mod.foo(...)
+    return None
+
+
+def collect_symbols(rel: str, tree: ast.AST) -> list:
+    """Per-file symbols (classes / top-level functions / one-level methods).
+
+    * ``start``/``end``/``loc`` are physical 1-based lines; a class's ``loc``
+      spans the whole class body while a method only covers itself.
+    * Functions nested *inside* functions are intentionally ignored (noise).
+    * ``calls`` are the callee names found by walking ``ast.Call`` nodes in the
+      symbol body, kept only when the name matches the file-local symbol *name*
+      set (class + function + method names), deduped and sorted.
+      Matching is by **bare name only**: two same-named methods sitting on
+      different classes (or a function and a method sharing a name) are
+      indistinguishable here.  This is a deliberate static approximation
+      agreed with the frontend.
+    * Symbols are ordered by ``start`` then ``name``; ids are ``<file>#<name>``
+      with a ``#2``/``#3``/... suffix appended on name collisions so ids stay
+      unique and deterministic.
+    """
+    local_names = set()
+    raw = []  # dicts: name, kind, start, end, body(list of stmts)
+
+    def end_line(node):
+        return getattr(node, "end_lineno", None) or node.lineno
+
+    for node in tree.body:
+        if isinstance(node, ast.ClassDef):
+            local_names.add(node.name)
+            methods = [
+                sub
+                for sub in node.body
+                if isinstance(sub, (ast.FunctionDef, ast.AsyncFunctionDef))
+            ]
+            for sub in methods:
+                local_names.add(sub.name)
+            raw.append(
+                {
+                    "name": node.name,
+                    "kind": "class",
+                    "start": node.lineno,
+                    "end": end_line(node),
+                    "body": node.body,
+                }
+            )
+            for sub in methods:
+                raw.append(
+                    {
+                        "name": sub.name,
+                        "kind": "method",
+                        "start": sub.lineno,
+                        "end": end_line(sub),
+                        "body": sub.body,
+                    }
+                )
+        elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            local_names.add(node.name)
+            raw.append(
+                {
+                    "name": node.name,
+                    "kind": "function",
+                    "start": node.lineno,
+                    "end": end_line(node),
+                    "body": node.body,
+                }
+            )
+
+    for sym in raw:
+        names = set()
+        for stmt in sym["body"]:
+            for n in ast.walk(stmt):
+                if isinstance(n, ast.Call):
+                    nm = _called_name(n)
+                    if nm and nm in local_names:
+                        names.add(nm)
+        sym["calls"] = sorted(names)
+        del sym["body"]
+
+    raw.sort(key=lambda s: (s["start"], s["name"]))
+
+    counts = defaultdict(int)
+    symbols = []
+    for sym in raw:
+        counts[sym["name"]] += 1
+        n = counts[sym["name"]]
+        suffix = "" if n == 1 else f"#{n}"
+        symbols.append(
+            {
+                "id": f"{rel}#{sym['name']}{suffix}",
+                "name": sym["name"],
+                "kind": sym["kind"],
+                "start": sym["start"],
+                "end": sym["end"],
+                "loc": sym["end"] - sym["start"] + 1,
+                "calls": sym["calls"],
+            }
+        )
+    return symbols
+
+
 # ---------------------------------------------------------------------------
 # Core extraction
 # ---------------------------------------------------------------------------
 
 
-def extract(root: Path, root_label: str, with_timestamp: bool) -> dict:
+def extract(root: Path, root_label: str, prefix: str, with_timestamp: bool) -> dict:
     py_files = list(iter_python_files(root))
 
     # --- pass 1: collect file ids, metrics and file existence set -----------
@@ -108,11 +236,15 @@ def extract(root: Path, root_label: str, with_timestamp: bool) -> dict:
 
     # --- pass 2: parse AST, collect metrics + raw edges ---------------------
     raw_edges = []            # list of (from_id, to_id) with multiplicity
+    file_symbols = {}         # id -> [symbol dict]  (sorted by start, name)
     unresolved = 0
+    parse_errors = 0
     code_lines_total = 0
     loc_total = 0
     def_total = 0
     class_total = 0
+    symbol_total = 0
+    symbol_edge_total = 0
 
     for path in py_files:
         rel = path.relative_to(root).as_posix()
@@ -135,9 +267,15 @@ def extract(root: Path, root_label: str, with_timestamp: bool) -> dict:
         defs = 0
         classes = 0
         try:
-            tree = ast.parse(text, filename=str(path))
+            # Parsed source may emit SyntaxWarning (e.g. invalid escape
+            # sequences); those are upstream code-quality signals, not
+            # extraction failures, so keep CLI output clean.
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore", SyntaxWarning)
+                tree = ast.parse(text, filename=str(path))
         except SyntaxError:
             tree = None
+            parse_errors += 1
 
         if tree is not None:
             for node in ast.walk(tree):
@@ -145,6 +283,12 @@ def extract(root: Path, root_label: str, with_timestamp: bool) -> dict:
                     defs += 1
                 elif isinstance(node, ast.ClassDef):
                     classes += 1
+
+            # --- per-file internal structure (symbols + intra-file calls) ----
+            symbols = collect_symbols(rel, tree)
+            file_symbols[rel] = symbols
+            symbol_total += len(symbols)
+            symbol_edge_total += sum(len(s["calls"]) for s in symbols)
 
             # package directory of this file (for relative import resolution).
             # For ``a/b/c.py`` -> ['a','b']; for ``a/b/__init__.py`` -> ['a','b'].
@@ -154,29 +298,47 @@ def extract(root: Path, root_label: str, with_timestamp: bool) -> dict:
                 if isinstance(node, ast.ImportFrom):
                     if node.level and node.level > 0:
                         # relative import: pop (level-1) dirs from package
-                        base = pkg_parts[: len(pkg_parts) - (node.level - 1)]
                         if node.level - 1 > len(pkg_parts):
                             unresolved += 1
                             continue
+                        base = pkg_parts[: len(pkg_parts) - (node.level - 1)]
                         mod_parts = node.module.split(".") if node.module else []
-                        target = resolve_parts(base + mod_parts)
+                        prefix_parts = base + mod_parts
                     else:
                         module = node.module or ""
-                        if module.startswith(SRT_PREFIX + "."):
-                            mod_parts = module[len(SRT_PREFIX) + 1 :].split(".")
-                            target = resolve_parts(mod_parts)
+                        if module == prefix or module.startswith(prefix + "."):
+                            prefix_parts = (
+                                []
+                                if module == prefix
+                                else module[len(prefix) + 1 :].split(".")
+                            )
                         else:
                             unresolved += 1
                             continue
-                    if target is None:
+                    # "from pkg import name": when pkg is a package, each name
+                    # is first tried as a submodule (pkg/name.py); resolved
+                    # names edge to the submodule instead of the package
+                    # __init__.  When nothing resolves as a submodule the
+                    # statement keeps its package/module edge (the names are
+                    # then symbols defined there).
+                    pkg_target = resolve_parts(prefix_parts)
+                    targets = []
+                    if pkg_target is not None and pkg_target.endswith("/__init__.py"):
+                        for alias in node.names:
+                            sub_t = resolve_parts(prefix_parts + [alias.name])
+                            if sub_t is not None and sub_t != rel:
+                                targets.append(sub_t)
+                    if not targets and pkg_target is not None and pkg_target != rel:
+                        targets.append(pkg_target)
+                    if not targets:
                         unresolved += 1
-                    elif target != rel:
-                        raw_edges.append((rel, target))
+                    else:
+                        raw_edges.extend((rel, t) for t in targets)
                 elif isinstance(node, ast.Import):
                     for alias in node.names:
                         module = alias.name
-                        if module.startswith(SRT_PREFIX + "."):
-                            mod_parts = module[len(SRT_PREFIX) + 1 :].split(".")
+                        if module.startswith(prefix + "."):
+                            mod_parts = module[len(prefix) + 1 :].split(".")
                             target = resolve_parts(mod_parts)
                         else:
                             unresolved += 1
@@ -299,6 +461,7 @@ def extract(root: Path, root_label: str, with_timestamp: bool) -> dict:
                 "fanOut": len(imps),
                 "fanIn": fan_in.get(rel, 0),
                 "imports": imps,
+                "symbols": file_symbols.get(rel, []),
             }
         )
 
@@ -337,7 +500,10 @@ def extract(root: Path, root_label: str, with_timestamp: bool) -> dict:
             "codeLinesTotal": code_lines_total,
             "defTotal": def_total,
             "classTotal": class_total,
+            "symbolTotal": symbol_total,
+            "symbolEdgeTotal": symbol_edge_total,
             "unresolvedImports": unresolved,
+            "parseErrors": parse_errors,
         },
         "districts": districts_out,
         "files": files_out,
@@ -357,13 +523,18 @@ def main(argv=None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "--root",
-        default=r"D:\code\sglang\sglang-main\python\sglang\srt",
-        help="source root to analyse (read-only)",
+        default=DEFAULT_ROOT,
+        help="source root to analyse (read-only); env SGLANG_SRT_ROOT overrides the default",
     )
     parser.add_argument(
         "--out",
-        default=r"D:\code\code-atlas\data\sglang-graph.json",
-        help="output JSON path",
+        default=str(DEFAULT_OUT),
+        help="output JSON path (default: <repo>/data/sglang-graph.json)",
+    )
+    parser.add_argument(
+        "--prefix",
+        default=DEFAULT_PREFIX,
+        help="absolute import prefix mapped onto the root (default: sglang.srt)",
     )
     parser.add_argument(
         "--root-label",
@@ -385,7 +556,7 @@ def main(argv=None) -> int:
         print(f"error: root not found: {root}", file=sys.stderr)
         return 2
 
-    data = extract(root, args.root_label, with_timestamp=not args.no_timestamp)
+    data = extract(root, args.root_label, args.prefix, with_timestamp=not args.no_timestamp)
 
     out_path = Path(args.out)
     out_path.parent.mkdir(parents=True, exist_ok=True)
@@ -399,6 +570,7 @@ def main(argv=None) -> int:
         "fileCount={fileCount} districtCount={districtCount} edgeCount={edgeCount} "
         "locTotal={locTotal} codeLinesTotal={codeLinesTotal} "
         "defTotal={defTotal} classTotal={classTotal} "
+        "symbolTotal={symbolTotal} symbolEdgeTotal={symbolEdgeTotal} "
         "unresolvedImports={unresolvedImports}".format(**m)
     )
     print(f"written: {out_path} ({out_path.stat().st_size} bytes)")

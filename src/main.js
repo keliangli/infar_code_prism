@@ -1,6 +1,8 @@
 import './style.css';
 import { CodeScene } from './scene.js';
-import { buildIndex, districtColor, formatNumber, searchFiles } from './derive.js';
+import {
+  buildIndex, districtColor, formatNumber, orderSymbols, searchFiles, symbolColor, symbolNeighbors
+} from './derive.js';
 
 // 请求生命周期的讲解步骤：每个步骤都指向抽取结果中真实存在的文件，避免出现悬空引用。
 const STORY = [
@@ -44,7 +46,7 @@ let storyTimer = null;
 let toastTimer = null;
 
 const state = {
-  district: null, file: null, colorMode: 'district', labels: true,
+  district: null, file: null, symbol: null, interior: null, colorMode: 'district', labels: true,
   story: false, storyIndex: 0, view: 'iso'
 };
 
@@ -66,13 +68,14 @@ async function boot() {
   renderDistricts();
   renderTopFanIn();
   scene = new CodeScene(document.querySelector('#stage-canvas'), {
-    onSelect: hit => selectNode(hit),
+    onSelect: hit => selectNode(hit, { toggle: true }),
     onHover: hit => setHint(hit)
   });
   scene.build(index);
   renderInspector();
   renderStory();
   renderCrumbs();
+  updateCityButton();
   wireEvents();
   applyRoute();
 }
@@ -97,10 +100,12 @@ function shell() {
         </div>
         <span class="divider"></span>
         <button data-action="overview">回到概览</button>
+        <button data-action="city" hidden>返回城市</button>
         <button data-action="labels" class="active">标签</button>
         <button data-action="heat">热度着色</button>
         <span class="divider"></span>
         <button data-action="story">数据流讲解</button>
+        <button data-action="fullscreen">全屏</button>
         <label class="search"><input id="search" type="search" placeholder="按路径搜索文件" aria-label="按路径搜索文件" autocomplete="off" /></label>
         <div class="suggest" id="suggest" hidden></div>
       </div>
@@ -161,7 +166,8 @@ function districtRow(district, indexInList) {
 }
 
 function renderDistricts() {
-  const list = [...graph.districts].sort((a, b) => b.loc - a.loc).slice(0, 24);
+  // 展示全部街区：layoutDistricts 与这里都按 loc 降序，列表序号与 3D 中的街区色相保持一致。
+  const list = [...graph.districts].sort((a, b) => b.loc - a.loc);
   document.querySelector('#nav-districts').innerHTML = list.map((district, i) => districtRow(district, i)).join('');
 }
 
@@ -179,19 +185,75 @@ function escapeAttr(value) {
   return String(value).replace(/"/g, '&quot;');
 }
 
-function edgeList(title, edges, emptyText) {
+function edgeList(title, edges, emptyText, scroll = false) {
   const rows = edges.length
-    ? edges.map(edge => `<button data-${edge.kind}="${escapeAttr(edge.id)}"><span class="path">${edge.id}</span><span class="meta">×${edge.weight}</span></button>`).join('')
+    ? edges.map(edge => `<button data-${edge.kind}="${escapeAttr(edge.id)}"><span class="path">${edge.label ?? edge.id}</span><span class="meta">${edge.meta ?? `×${edge.weight}`}</span></button>`).join('')
     : `<span class="note">${emptyText}</span>`;
-  return `<div class="panel-block"><h2>${title}</h2><div class="list">${rows}</div></div>`;
+  return `<div class="panel-block"><h2>${title}</h2><div class="list${scroll ? ' scroll' : ''}">${rows}</div></div>`;
+}
+
+function symbolRow(symbol, active) {
+  return `<button data-symbol="${escapeAttr(symbol.id)}" class="${active ? 'active' : ''}">
+    <span class="dot" style="background:${symbolColor(symbol.kind)}"></span>
+    <span class="path">${symbol.name}</span>
+    <span class="meta">${symbol.kind} · ${symbol.start}–${symbol.end} · ${symbol.loc} 行</span>
+  </button>`;
 }
 
 function renderInspector() {
   const el = document.querySelector('#inspector');
+  if (state.interior) {
+    const file = index.filesById.get(state.interior);
+    const symbols = orderSymbols(file.symbols);
+    if (state.symbol && !symbols.some(item => item.id === state.symbol)) state.symbol = null;
+    const symbol = state.symbol ? symbols.find(item => item.id === state.symbol) : null;
+    if (!symbol) {
+      const kinds = { class: 0, function: 0, method: 0 };
+      let callEdges = 0;
+      for (const item of symbols) { kinds[item.kind] = (kinds[item.kind] || 0) + 1; callEdges += item.calls?.length || 0; }
+      el.innerHTML = `
+        <div class="panel-block identity">
+          <h2>建筑检查器 · 内部视图</h2>
+          <code>${file.id}</code>
+          <span>${file.symbols.length} 个符号 · ${formatNumber(file.loc)} 行 · 自下而上按起始行排列</span>
+        </div>
+        <div class="panel-block"><div class="stat-grid">
+          <div><span>类</span><strong>${formatNumber(kinds.class || 0)}</strong></div>
+          <div><span>函数</span><strong>${formatNumber(kinds.function || 0)}</strong></div>
+          <div><span>方法</span><strong>${formatNumber(kinds.method || 0)}</strong></div>
+          <div><span>调用边（同文件）</span><strong>${formatNumber(callEdges)}</strong></div>
+        </div></div>
+        <div class="panel-block"><div class="list scroll">
+          ${symbols.map(item => symbolRow(item, false)).join('')}
+        </div></div>
+        <div class="panel-block"><button class="action" data-action="city">返回城市</button></div>`;
+      bindInspector();
+      return;
+    }
+    const { out, in: incoming } = symbolNeighbors(file, symbol.id);
+    el.innerHTML = `
+      <div class="panel-block identity">
+        <h2>楼层检查器 · 符号</h2>
+        <code>${symbol.name}</code>
+        <span>${file.id} · ${symbol.kind} · 行 ${symbol.start}–${symbol.end} · ${formatNumber(symbol.loc)} 行</span>
+      </div>
+      <div class="panel-block"><div class="stat-grid">
+        <div><span>类型</span><strong>${symbol.kind}</strong></div>
+        <div><span>行数</span><strong>${formatNumber(symbol.loc)}</strong></div>
+        <div><span>调用出去</span><strong>${out.length}</strong></div>
+        <div><span>被调用</span><strong>${incoming.length}</strong></div>
+      </div></div>
+      ${edgeList('它调用（同文件符号）', out.map(item => ({ id: item.id, kind: 'symbol', label: item.name, meta: item.kind })), '没有调用同文件里的其他符号。', true)}
+      ${edgeList('被哪些同文件符号调用', incoming.map(item => ({ id: item.id, kind: 'symbol', label: item.name, meta: item.kind })), '没有被同文件符号调用。', true)}
+      <div class="panel-block"><button class="back" data-action="symbols-back">← 返回符号列表</button></div>`;
+    bindInspector();
+    return;
+  }
   if (state.file) {
     const file = index.filesById.get(state.file);
     const out = (index.outMap.get(file.id) || []).slice(0, 10).map(edge => ({ ...edge, kind: 'file' }));
     const incoming = (index.inMap.get(file.id) || []).slice(0, 10).map(edge => ({ ...edge, kind: 'file' }));
+    const symbolCount = file.symbols?.length || 0;
     el.innerHTML = `
       <div class="panel-block identity">
         <h2>建筑检查器 · 文件</h2>
@@ -206,6 +268,11 @@ function renderInspector() {
         <div><span>依赖出去</span><strong>${file.fanOut}</strong></div>
         <div><span>被依赖</span><strong>${file.fanIn}</strong></div>
       </div></div>
+      <div class="panel-block">
+        <button class="action" data-enter-interior="${escapeAttr(file.id)}" ${symbolCount ? '' : 'disabled'}>
+          进入内部视图${symbolCount ? ` · ${symbolCount} 个符号` : '（没有抽取到符号）'}
+        </button>
+      </div>
       ${edgeList('它依赖（imports）', out, '没有解析到内部依赖。')}
       ${edgeList('谁依赖它（imported by）', incoming, '没有同根文件引用它。')}`;
     bindInspector();
@@ -257,6 +324,10 @@ function renderInspector() {
 function bindInspector(scope = document.querySelector('#inspector')) {
   scope.querySelectorAll('[data-district]').forEach(node => node.addEventListener('click', () => selectNode({ kind: 'district', id: node.dataset.district })));
   scope.querySelectorAll('[data-file]').forEach(node => node.addEventListener('click', () => selectNode({ kind: 'file', id: node.dataset.file })));
+  scope.querySelectorAll('[data-symbol]').forEach(node => node.addEventListener('click', () => selectSymbol(node.dataset.symbol)));
+  scope.querySelectorAll('[data-enter-interior]').forEach(node => node.addEventListener('click', () => enterInterior(node.dataset.enterInterior)));
+  scope.querySelectorAll('[data-action="city"]').forEach(node => node.addEventListener('click', () => exitInterior()));
+  scope.querySelectorAll('[data-action="symbols-back"]').forEach(node => node.addEventListener('click', () => selectSymbol(null)));
 }
 
 function renderStory() {
@@ -278,8 +349,15 @@ function renderStory() {
 }
 
 function renderCrumbs() {
-  const title = state.file ? state.file.split('/').pop() : state.district || '概览';
+  const file = state.interior ? index.filesById.get(state.interior) : null;
+  const title = file
+    ? `${state.interior.split('/').pop()} · 内部`
+    : state.file ? state.file.split('/').pop() : state.district || '概览';
   document.querySelector('#stage-title').textContent = title;
+  if (file) {
+    document.querySelector('#stage-subtitle').textContent = `${file.symbols.length} 个符号 · ${formatNumber(file.loc)} 行 · 每层一个符号`;
+    return;
+  }
   const district = state.file ? index.filesById.get(state.file)?.district : state.district;
   const locus = index.districtById.get(district);
   document.querySelector('#stage-subtitle').textContent = locus
@@ -289,14 +367,27 @@ function renderCrumbs() {
 
 function setHint(hit) {
   const hint = document.querySelector('#hint');
-  if (!hit) { hint.textContent = '点击街区看文件构成，点击建筑看依赖'; return; }
+  if (!hit) {
+    hint.textContent = state.interior
+      ? '点击楼层看它调用谁、又被谁调用；按 Esc 或“返回城市”退出'
+      : '点击街区看文件构成，点击建筑看依赖';
+    return;
+  }
+  if (hit.kind === 'symbol') {
+    hint.textContent = `${hit.name} · ${hit.symbolKind} · 行 ${hit.start}–${hit.end}（${hit.loc} 行） · 点击看它的同文件调用`;
+    return;
+  }
   hint.textContent = hit.kind === 'district'
     ? `${hit.id} · 点击展开这个街区的文件`
-    : `${hit.id} · 点击查看它的依赖`;
+    : `${hit.id} · 点击查看它的依赖（已选中时再点一次进入内部视图）`;
 }
 
 function selectNode({ kind, id }, options = {}) {
   if (!index) return;
+  if (kind === 'symbol') { selectSymbol(id); return; }
+  // 已选中同一栋建筑时再次点击，等价于下钻到文件内部。
+  if (options.toggle && kind === 'file' && id === state.file && state.interior !== id) { enterInterior(id); return; }
+  leaveInterior();
   if (kind === 'district') {
     if (!index.districtById.has(id)) return;
     state.district = id;
@@ -317,7 +408,77 @@ function selectNode({ kind, id }, options = {}) {
   updateHash();
 }
 
+// ---- 内部视图：状态与场景同步 ----
+function enterInterior(fileId) {
+  if (!index) return;
+  const file = index.filesById.get(fileId);
+  if (!file) return;
+  if (!(file.symbols?.length)) { notify(`${fileId} 没有抽取到符号，无法进入内部视图。`); return; }
+  if (state.story) setStory(false);
+  if (!scene.setInterior(fileId)) { notify(`${fileId} 无法进入内部视图。`); return; }
+  state.interior = fileId;
+  state.symbol = null;
+  state.file = fileId;
+  state.district = file.district;
+  scene.setSelection({ kind: 'file', id: fileId });
+  scene.frame({ kind: 'file', id: fileId });
+  renderDistricts();
+  renderTopFanIn();
+  renderInspector();
+  renderCrumbs();
+  updateCityButton();
+  updateHash();
+  notify(`内部视图：${file.symbols.length} 个符号各占一层，层高按行数（对数）分配；点楼层或右侧列表看它的同文件调用。`);
+}
+
+function exitInterior() {
+  if (!state.interior) return;
+  const file = state.interior;
+  state.interior = null;
+  state.symbol = null;
+  scene.clearInterior();
+  if (state.file) {
+    scene.setSelection({ kind: 'file', id: state.file });
+    scene.frame({ kind: 'file', id: state.file });
+  } else {
+    scene.setSelection(null);
+    scene.frameAll();
+  }
+  renderInspector();
+  renderCrumbs();
+  updateCityButton();
+  updateHash();
+  notify(`已回到城市视图：${file} 恢复为建筑。`);
+}
+
+// 退出内部视图但不重渲染面板（供切换选中项时复用）。
+function leaveInterior() {
+  if (!state.interior) return;
+  state.interior = null;
+  state.symbol = null;
+  scene.clearInterior();
+  updateCityButton();
+}
+
+function selectSymbol(symbolId) {
+  if (!state.interior) return;
+  const file = index.filesById.get(state.interior);
+  if (symbolId && !file?.symbols?.some(symbol => symbol.id === symbolId)) return;
+  state.symbol = symbolId || null;
+  scene.setSelection(state.symbol
+    ? { kind: 'symbol', id: state.symbol, file: state.interior }
+    : { kind: 'file', id: state.interior });
+  renderInspector();
+  renderCrumbs();
+}
+
+function updateCityButton() {
+  const button = document.querySelector('[data-action="city"]');
+  if (button) button.hidden = !state.interior;
+}
+
 function showOverview() {
+  leaveInterior();
   state.district = null;
   state.file = null;
   scene.setSelection(null);
@@ -366,14 +527,31 @@ function stopStoryTimer() {
 }
 
 function updateHash() {
-  const hash = state.file ? `#/f/${encodeURIComponent(state.file)}` : state.district ? `#/d/${state.district}` : '#/';
+  const hash = state.interior
+    ? `#/i/${encodeURIComponent(state.interior)}`
+    : state.file ? `#/f/${encodeURIComponent(state.file)}` : state.district ? `#/d/${state.district}` : '#/';
   history.replaceState(null, '', hash);
 }
 
+async function toggleFullscreen() {
+  const viewport = document.querySelector('.viewport');
+  try {
+    if (document.fullscreenElement) await document.exitFullscreen();
+    else await viewport.requestFullscreen();
+  } catch {
+    notify('当前浏览器不支持全屏，可用浏览器缩放代替。');
+  }
+}
+
 function applyRoute() {
-  const match = /^#\/(?:([df])\/(.+))?$/.exec(location.hash);
+  const match = /^#\/(?:([dif])\/(.+))?$/.exec(location.hash);
   if (!match || !match[1]) { showOverview(); return; }
   const id = decodeURIComponent(match[2]);
+  if (match[1] === 'i') {
+    selectNode({ kind: 'file', id });
+    if (state.file === id) enterInterior(id);
+    return;
+  }
   selectNode({ kind: match[1] === 'd' ? 'district' : 'file', id });
 }
 
@@ -398,6 +576,7 @@ function wireEvents() {
     if (!target) return;
     const action = target.dataset.action;
     if (action === 'overview') showOverview();
+    if (action === 'city') exitInterior();
     if (action === 'labels') {
       state.labels = !state.labels;
       target.classList.toggle('active', state.labels);
@@ -410,6 +589,7 @@ function wireEvents() {
       notify(state.colorMode === 'heat' ? '按被依赖程度着色：越暖表示被同根文件 import 得越多。' : '按街区着色。');
     }
     if (action === 'story') setStory(!state.story);
+    if (action === 'fullscreen') toggleFullscreen();
     if (action === 'zoom-in') scene.zoom(1);
     if (action === 'zoom-out') scene.zoom(-1);
     if (action === 'reset') scene.reset();
@@ -452,7 +632,11 @@ function wireEvents() {
       document.querySelectorAll('[data-view]').forEach(node => node.classList.toggle('active', node.dataset.view === view));
       scene.setView(view);
     }
-    if (event.key === 'Escape') showOverview();
+    // Esc：内部视图先退回该文件的城市视图，再按一次才回概览。
+    if (event.key === 'Escape') {
+      if (state.interior) exitInterior();
+      else showOverview();
+    }
     if (state.story && event.key === 'ArrowRight') { event.preventDefault(); gotoStory(state.storyIndex + 1); }
     if (state.story && event.key === 'ArrowLeft') { event.preventDefault(); gotoStory(state.storyIndex - 1); }
   });
