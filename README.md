@@ -9,8 +9,22 @@
 - **回答空间问题**：“这块代码在哪、有多大、和谁相邻”，而不是“运行时到底怎么被调用”。
 - **四个层级**：概览（44 个街区）→ 街区（子包内的文件构成、跨街区依赖）→ 建筑（单个文件的指标与依赖清单）→ 内部楼层（文件内的类 / 函数 / 方法与同文件调用）。
 - **两种着色**：按街区区分，或切到“热度着色”看被同根文件 import 的多少。
+- **版本对比**：与一个基线快照比对，看哪些包在膨胀、哪些文件被拆掉（开启时才按需加载基线数据）。
 
-## 数据快照
+## 数据快照与版本对比
+
+当前快照（`main`）与基线快照（`v0.5.12`）：
+
+| 指标 | 基线 v0.5.12 | 当前 main | Δ |
+| --- | --- | --- | --- |
+| 文件 | 1,186 | 1,904 | +718 |
+| 总行数 | 498,450 | 820,221 | +321,771 |
+| 文件间 import 边 | 6,903 | 11,234 | +4,331 |
+| 符号（类 / 函数 / 方法） | 18,448 | 30,751 | +12,303 |
+
+变化分类（开启版本对比后可切换着色）：**新增 854 / 删除 136 / 增长 602 / 缩小 158**。街区层面也能看出结构变动：`beam_search`、`kv_canary`、`rust_extensions`、`rust_server`、`weight_cache` 是新增的，`grpc` 在基线里存在、当前已移除；`mem_cache` 由 65 个文件涨到 150 个。
+
+### 当前快照明细
 
 | 指标 | 数值 |
 | --- | --- |
@@ -39,9 +53,18 @@ npm run dev
 
 ```sh
 npm run graph                                  # 默认抽取 python/sglang/srt（需要本地存在该检出）
-python tools/extract_graph.py --root <路径> --prefix <导入前缀>    # 抽取任意 Python 包
+python tools/extract_graph.py --root <路径>    # 抽取任意 Python 包
 node scripts/sync-graph.mjs                    # 把 data/ 下的产物同步到 public/
 ```
+
+重新生成基线快照（用于版本对比）：
+
+```sh
+npm run graph:previous                       # 默认取 v0.5.12
+node scripts/make-baseline.mjs v0.5.16       # 指定其它 ref
+```
+
+脚本用 `git archive` 把旧版本标签里的 `python/sglang/srt` 导出到临时目录、复用同一个抽取器，再清理临时文件；不修改你的 sglang 检出。可用环境变量 `SGLANG_REPO`、`SGLANG_BASELINE_REF` 覆盖默认值。
 
 抽取器只用 Python 标准库的 `ast`，不执行被解析的代码，输出为确定性 JSON（同一输入两次运行的哈希一致）。默认源码根目录可用环境变量 `SGLANG_SRT_ROOT` 覆盖；`--prefix` 指定绝对导入映射到根目录的前缀（默认 `sglang.srt`），`from pkg import sub` 会优先解析到子模块 `pkg/sub.py` 而非包 `__init__.py`。
 
@@ -59,6 +82,7 @@ node scripts/sync-graph.mjs                    # 把 data/ 下的产物同步到
 | 透视 / 俯视 / 侧视 | 相机预设（键盘 `1` `2` `3`） |
 | 标签 | 显示或隐藏街区标签；聚焦街区时显示最大的若干文件标签 |
 | 热度着色 | 按被依赖程度着色（越暖表示被 import 越多） |
+| 版本对比 | 开启后建筑按变化类别着色（新增=绿、删除=红、增长=暖橙、缩小=蓝、不变=灰），顶部给出两版本总量对比，右侧出现「增长最多 / 缩小最多 / 新增 / 删除」四个榜单；被删除的文件以红色半透明影板落在所属街区的空位里 |
 | 数据流讲解 | 按模块顺序讲解一次请求的生命周期（`←` `→` 单步） |
 | 进入内部视图 | 文件检查器里的按钮，或在已选中的那根柱子上再点一次：柱子展开为一摞楼层（每层 = 一个类 / 函数 / 方法），其它街区自动变暗 |
 | 内部视图里的楼层 | 点楼层或右侧符号列表即可查看：类型、行范围、行数、它调用的同文件符号、以及被哪些同文件符号调用；点依赖项可直接跳转并在 3D 中画出调用连线（出=青、入=紫） |
@@ -82,9 +106,11 @@ node scripts/sync-graph.mjs                    # 把 data/ 下的产物同步到
 .
 ├── tools/extract_graph.py      静态依赖抽取（标准库 ast，确定性输出）
 ├── scripts/sync-graph.mjs      把抽取产物同步到 public/
+├── scripts/make-baseline.mjs   从旧版本标签生成基线快照（版本对比用）
 ├── scripts/check-ids.mjs       自检：JS 引用的 #id 是否都已声明
 ├── data/sglang-graph.json      抽取产物（存入 public/ 供前端读取）
 ├── public/graph.json           前端实际加载的数据
+├── public/graph.previous.json  基线快照（6.5 MB，仅在开启版本对比时加载）
 ├── src/derive.js               纯逻辑：布局、配色、邻居与搜索（可单测）
 ├── src/scene.js                Three.js 场景：InstancedMesh 建筑、拾取、依赖连线、标签
 ├── src/main.js                 界面：面板、检查器、讲解步骤、路由与快捷键

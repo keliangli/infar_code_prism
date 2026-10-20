@@ -6,6 +6,7 @@
   "description": "把源码依赖图渲染成可交互的 3D 代码地图",
   "scripts": {
     "graph": "python tools/extract_graph.py && node scripts/sync-graph.mjs",
+    "graph:previous": "node scripts/make-baseline.mjs && node scripts/sync-graph.mjs",
     "dev": "vite --host 127.0.0.1",
     "build": "vite build",
     "preview": "vite preview --host 127.0.0.1",

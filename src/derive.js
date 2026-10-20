@@ -36,6 +36,14 @@ export function heatColor(ratio) {
   return `hsl(${hue.toFixed(0)}, 78%, ${light.toFixed(0)}%)`;
 }
 
+// 版本对比配色：新增=绿、删除=红、增长=暖橙、缩小=蓝、不变=低饱和灰。
+export const DIFF_COLORS = { added: '#6ee7a8', removed: '#f87171', grown: '#f6a04d', shrunk: '#6aa6ff', stable: '#7f8ea8' };
+export const CHANGE_LABELS = { added: '新增', removed: '删除', grown: '增长', shrunk: '缩小', stable: '不变' };
+
+export function diffColor(change) {
+  return DIFF_COLORS[change] || DIFF_COLORS.stable;
+}
+
 // 街区内的建筑排序：先按二级目录分组，再按行数降序，让同一子目录的楼连成一片。
 export function orderDistrictFiles(district, filesById) {
   return [...district.files].sort((a, b) => {
@@ -188,4 +196,86 @@ export function searchFiles(graph, keyword, limit = 12) {
     .filter(file => file.id.toLowerCase().includes(needle))
     .sort((a, b) => b.loc - a.loc)
     .slice(0, limit);
+}
+
+// ---- 版本对比（delta）：在两个同 schema 快照间做逐文件差量 ----
+
+// 变化归类：只看 Δloc / Δsymbols / ΔfanIn 三个口径，先比行数再比符号数、被依赖数。
+export function changeBetween(base, current) {
+  if (!base) return 'added';
+  if (!current) return 'removed';
+  const dLoc = (current.loc || 0) - (base.loc || 0);
+  if (dLoc !== 0) return dLoc > 0 ? 'grown' : 'shrunk';
+  const dSymbols = (current.symbols?.length || 0) - (base.symbols?.length || 0);
+  if (dSymbols !== 0) return dSymbols > 0 ? 'grown' : 'shrunk';
+  const dFanIn = (current.fanIn || 0) - (base.fanIn || 0);
+  if (dFanIn !== 0) return dFanIn > 0 ? 'grown' : 'shrunk';
+  return 'stable';
+}
+
+function numberOf(value) {
+  return Number.isFinite(value) ? value : 0;
+}
+
+function locTotalOf(graph) {
+  return numberOf(graph.meta?.locTotal) || graph.files.reduce((acc, file) => acc + (file.loc || 0), 0);
+}
+
+function edgeCountOf(graph) {
+  return numberOf(graph.meta?.edgeCount) || (graph.imports?.length || 0);
+}
+
+function symbolTotalOf(graph) {
+  return numberOf(graph.meta?.symbolTotal) || graph.files.reduce((acc, file) => acc + (file.symbols?.length || 0), 0);
+}
+
+const BOARD_LIMIT = 8;
+
+// 汇总两个快照的对比结果：逐文件条目、总量统计与四个榜单。缺少基线时返回 null。
+export function buildDiff(graph, previous) {
+  if (!graph || !previous || !Array.isArray(graph.files) || !Array.isArray(previous.files)) return null;
+  const baseById = new Map(previous.files.map(file => [file.id, file]));
+  const currentById = new Map(graph.files.map(file => [file.id, file]));
+  const entries = new Map();
+  const counts = { added: 0, removed: 0, grown: 0, shrunk: 0, stable: 0 };
+  for (const id of new Set([...baseById.keys(), ...currentById.keys()])) {
+    const base = baseById.get(id) || null;
+    const current = currentById.get(id) || null;
+    const change = changeBetween(base, current);
+    counts[change] += 1;
+    const source = current || base;
+    entries.set(id, {
+      id, change, district: source.district || null,
+      loc: { old: base ? base.loc : null, new: current ? current.loc : null, delta: (current?.loc || 0) - (base?.loc || 0) },
+      symbols: { old: base ? base.symbols?.length || 0 : null, new: current ? current.symbols?.length || 0 : null, delta: (current?.symbols?.length || 0) - (base?.symbols?.length || 0) },
+      fanIn: { old: base ? base.fanIn || 0 : null, new: current ? current.fanIn || 0 : null, delta: (current?.fanIn || 0) - (base?.fanIn || 0) }
+    });
+  }
+  const all = [...entries.values()];
+  const meters = (oldValue, newValue) => ({ old: oldValue, new: newValue, delta: newValue - oldValue });
+  const stats = {
+    fileCount: meters(previous.files.length, graph.files.length),
+    locTotal: meters(locTotalOf(previous), locTotalOf(graph)),
+    edgeCount: meters(edgeCountOf(previous), edgeCountOf(graph)),
+    symbolTotal: meters(symbolTotalOf(previous), symbolTotalOf(graph)),
+    counts
+  };
+  const top = (list, compare) => list.sort(compare).slice(0, BOARD_LIMIT);
+  const boards = {
+    grown: top(all.filter(entry => entry.change === 'grown'), (a, b) => b.loc.delta - a.loc.delta || b.symbols.delta - a.symbols.delta),
+    shrunk: top(all.filter(entry => entry.change === 'shrunk'), (a, b) => a.loc.delta - b.loc.delta || a.symbols.delta - b.symbols.delta),
+    added: top(all.filter(entry => entry.change === 'added'), (a, b) => (b.loc.new || 0) - (a.loc.new || 0)),
+    removed: top(all.filter(entry => entry.change === 'removed'), (a, b) => (b.loc.old || 0) - (a.loc.old || 0))
+  };
+  return { entries, stats, boards };
+}
+
+// 单个街区的变化计数（删掉的街区取基线里的归属）。
+export function summarizeDistrict(diff, districtId) {
+  const counts = { added: 0, removed: 0, grown: 0, shrunk: 0, stable: 0 };
+  if (!diff || !districtId) return counts;
+  for (const entry of diff.entries.values()) {
+    if (entry.district === districtId) counts[entry.change] += 1;
+  }
+  return counts;
 }

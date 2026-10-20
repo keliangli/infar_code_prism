@@ -1,8 +1,8 @@
 import * as THREE from 'three';
 import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
 import {
-  FILE_FOOTPRINT, districtColor, fileOffset, heatColor, heightForLoc, layoutDistricts, layoutFloors, neighborsFor,
-  symbolNeighbors
+  FILE_FOOTPRINT, diffColor, districtColor, fileOffset, heatColor, heightForLoc, layoutDistricts, layoutFloors,
+  neighborsFor, symbolNeighbors
 } from './derive.js';
 
 const LABEL_CSS = `
@@ -25,6 +25,9 @@ export class CodeScene {
     this.onHover = onHover;
     this.labelsVisible = true;
     this.colorMode = 'district';
+    this.diff = null;            // buildDiff 结果：非空即进入对比模式
+    this.compare = false;
+    this.shadows = [];
     this.selection = null;
     this.focusDistrict = null;
     this.disposed = false;
@@ -96,6 +99,10 @@ export class CodeScene {
     this.slabGeometry = new THREE.BoxGeometry(1, .12, 1);
     this.geometries.add(this.slabGeometry);
     this.slabMaterial = this.track(new THREE.MeshStandardMaterial({ color: 0x1b2740, roughness: .86, metalness: .1 }));
+    // 删除文件没有当前的建筑，用一块扁平红色影板代替，占据 plot 里的空网格。
+    this.shadowGeometry = this.track(new THREE.BoxGeometry(1, .1, 1));
+    this.shadowGeometry.translate(0, .05, 0);
+    this.shadowMaterial = this.track(new THREE.MeshStandardMaterial({ color: 0xf87171, roughness: .9, metalness: 0, transparent: true, opacity: .42 }));
     this.outLineMaterial = this.track(new THREE.LineBasicMaterial({ color: 0x63d3e6, transparent: true, opacity: .8 }));
     this.inLineMaterial = this.track(new THREE.LineBasicMaterial({ color: 0xd79cf0, transparent: true, opacity: .72 }));
     this.plotOutlineMaterial = this.track(new THREE.LineBasicMaterial({ color: 0x44628c, transparent: true, opacity: .65 }));
@@ -205,9 +212,55 @@ export class CodeScene {
   }
 
   colorFor(file, plotIndex) {
+    if (this.compare && this.diff) {
+      const entry = this.diff.entries.get(file.id);
+      return diffColor(entry ? entry.change : 'stable');
+    }
     return this.colorMode === 'heat'
       ? heatColor(Math.log10(file.fanIn + 1) / Math.log10(Math.max(2, this.index.maxFanIn + 1)))
       : districtColor(plotIndex);
+  }
+
+  // 开关对比模式：非空 diff 打开，null 关闭并清掉影板。高度始终按当前 loc 口径，不受影响。
+  setDiff(diff) {
+    this.diff = diff || null;
+    this.compare = !!this.diff;
+    this.repaint();
+    this.buildShadows();
+  }
+
+  // 把 removed 文件放进所属街区 plot 里未被占用的网格位；没有空位就跳过 3D 表达。
+  buildShadows() {
+    this.clearShadows();
+    if (!this.compare || !this.diff || !this.layout) return;
+    const byDistrict = new Map();
+    for (const entry of this.diff.entries.values()) {
+      if (entry.change !== 'removed' || !entry.district) continue;
+      if (!byDistrict.has(entry.district)) byDistrict.set(entry.district, []);
+      byDistrict.get(entry.district).push(entry);
+    }
+    for (const plot of this.layout.plots) {
+      const removed = byDistrict.get(plot.id);
+      if (!removed?.length) continue;
+      const capacity = plot.cols * plot.rows;
+      let slot = plot.files.length;
+      for (const entry of removed.sort((a, b) => (b.loc.old || 0) - (a.loc.old || 0))) {
+        if (slot >= capacity) break;
+        const { dx, dz } = fileOffset(plot, slot);
+        const mesh = new THREE.Mesh(this.shadowGeometry, this.shadowMaterial);
+        mesh.position.set(plot.x + dx, 0, plot.z + dz);
+        mesh.scale.set(FILE_FOOTPRINT * .88, 1, FILE_FOOTPRINT * .88);
+        mesh.userData.pick = { kind: 'file', id: entry.id, removed: true };
+        this.scene.add(mesh);
+        this.shadows.push(mesh);
+        slot += 1;
+      }
+    }
+  }
+
+  clearShadows() {
+    for (const mesh of this.shadows) this.scene.remove(mesh);
+    this.shadows = [];
   }
 
   repaint() {
@@ -696,7 +749,7 @@ export class CodeScene {
         };
       }
     }
-    const hits = this.raycaster.intersectObjects([...this.districtMeshes.values(), ...this.pickSlabs], false);
+    const hits = this.raycaster.intersectObjects([...this.districtMeshes.values(), ...this.pickSlabs, ...this.shadows], false);
     for (const hit of hits) {
       if (hit.object.userData?.pick) return hit.object.userData.pick;
       const fileIds = hit.object.userData?.fileIds;
@@ -726,6 +779,7 @@ export class CodeScene {
     canvas.removeEventListener('pointerleave', this.onPointerLeave);
     for (const child of this.lineGroup.children) child.geometry.dispose();
     this.clearInterior();
+    this.clearShadows();
     this.marker.geometry.dispose();
     for (const geometry of this.geometries) geometry.dispose();
     for (const material of this.materials) material.dispose();

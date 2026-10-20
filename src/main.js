@@ -1,7 +1,8 @@
 import './style.css';
 import { CodeScene } from './scene.js';
 import {
-  buildIndex, districtColor, formatNumber, orderSymbols, searchFiles, symbolColor, symbolNeighbors
+  buildDiff, buildIndex, CHANGE_LABELS, diffColor, districtColor, formatNumber, orderSymbols, searchFiles,
+  symbolColor, symbolNeighbors, summarizeDistrict
 } from './derive.js';
 
 // 请求生命周期的讲解步骤：每个步骤都指向抽取结果中真实存在的文件，避免出现悬空引用。
@@ -44,10 +45,12 @@ let index = null;
 let scene = null;
 let storyTimer = null;
 let toastTimer = null;
+let baselineAvailable = false;   // public/graph.previous.json 是否存在
+let diff = null;                 // buildDiff 结果，首次开启对比时按需构建
 
 const state = {
   district: null, file: null, symbol: null, interior: null, colorMode: 'district', labels: true,
-  story: false, storyIndex: 0, view: 'iso'
+  story: false, storyIndex: 0, view: 'iso', compare: false, removed: null
 };
 
 boot().catch(error => {
@@ -68,7 +71,7 @@ async function boot() {
   renderDistricts();
   renderTopFanIn();
   scene = new CodeScene(document.querySelector('#stage-canvas'), {
-    onSelect: hit => selectNode(hit, { toggle: true }),
+    onSelect: hit => (hit?.removed ? showRemovedFile(hit.id) : selectNode(hit, { toggle: true })),
     onHover: hit => setHint(hit)
   });
   scene.build(index);
@@ -76,8 +79,21 @@ async function boot() {
   renderStory();
   renderCrumbs();
   updateCityButton();
+  updateCompareButton();
   wireEvents();
   applyRoute();
+  probeBaseline();
+}
+
+// 只探测基线文件是否存在（HEAD，不下载内容）；真正的数据在用户开启对比时才拉。
+async function probeBaseline() {
+  try {
+    const response = await fetch(`${import.meta.env.BASE_URL}graph.previous.json`, { method: 'HEAD', cache: 'no-store' });
+    baselineAvailable = response.ok;
+  } catch {
+    baselineAvailable = false;
+  }
+  updateCompareButton();
 }
 
 function shell() {
@@ -103,6 +119,7 @@ function shell() {
         <button data-action="city" hidden>返回城市</button>
         <button data-action="labels" class="active">标签</button>
         <button data-action="heat">热度着色</button>
+        <button data-action="compare" title="需要先生成 public/graph.previous.json">版本对比</button>
         <span class="divider"></span>
         <button data-action="story">数据流讲解</button>
         <button data-action="fullscreen">全屏</button>
@@ -140,20 +157,44 @@ function shell() {
 
 function renderHeaderStats() {
   const { meta } = graph;
-  document.querySelector('#header-stats').innerHTML = [
+  const cell = (label, value) => `<div><span>${label}</span><strong>${value}</strong></div>`;
+  const rows = [
     ['文件', formatNumber(meta.fileCount)],
     ['总行数', formatNumber(meta.locTotal)],
     ['依赖边', formatNumber(meta.edgeCount)],
     ['一级子包', formatNumber(meta.districtCount)],
     ['未解析 import', formatNumber(meta.unresolvedImports)]
-  ].map(([label, value]) => `<div><span>${label}</span><strong>${value}</strong></div>`).join('');
+  ];
+  let html = rows.map(([label, value]) => cell(label, value)).join('');
+  if (state.compare && diff) html += compareHeaderHtml(diff);
+  document.querySelector('#header-stats').innerHTML = html;
+}
+
+// 顶部统计区的对比块：四个总量各给出“旧 → 新（Δ）”，再列出四类变化的计数。
+function compareHeaderHtml(data) {
+  const meters = [
+    ['文件', data.stats.fileCount],
+    ['总行数', data.stats.locTotal],
+    ['依赖边', data.stats.edgeCount],
+    ['符号数', data.stats.symbolTotal]
+  ];
+  const metersHtml = meters.map(([label, meter]) =>
+    `<div><span>Δ ${label}</span><strong>${formatNumber(meter.old)} → ${formatNumber(meter.new)} <i class="${deltaClass(meter.delta)}">${signedDelta(meter.delta)}</i></strong></div>`).join('');
+  const countsHtml = ['added', 'removed', 'grown', 'shrunk'].map(change =>
+    `<div><span>${CHANGE_LABELS[change]}</span><strong><i class="d-dot" style="background:${diffColor(change)}"></i>${formatNumber(data.stats.counts[change])}</strong></div>`).join('');
+  return `<div class="stat-divider"></div>${metersHtml}${countsHtml}`;
 }
 
 function renderLegend() {
+  const diffRows = state.compare && diff
+    ? ['added', 'removed', 'grown', 'shrunk', 'stable'].map(change =>
+      `<div class="row"><span><i class="d-dot" style="background:${diffColor(change)}"></i>${CHANGE_LABELS[change]}</span><span>${formatNumber(diff.stats.counts[change])}</span></div>`).join('')
+    : '';
   document.querySelector('#legend').innerHTML = `
     <div class="bar"></div>
     <div class="row"><span>建筑高度 ∝ 文件行数（对数）</span><span>最高 ${formatNumber(index.maxLoc)} 行</span></div>
     <div class="row"><span>颜色：默认按街区区分</span><span>切换“热度着色”看被依赖程度</span></div>
+    ${diffRows}
     <p class="note">数据来自 <code>python/sglang/srt</code> 的静态 AST 抽取，生成于 ${new Date(graph.meta.generatedAt).toLocaleString('zh-CN')}。依赖边表示 import 关系，不等于运行时调用关系；注册表、插件与 hook 造成的动态装配不在图中。</p>`;
 }
 
@@ -202,6 +243,27 @@ function symbolRow(symbol, active) {
 
 function renderInspector() {
   const el = document.querySelector('#inspector');
+  if (state.removed) {
+    const entry = diff?.entries.get(state.removed);
+    if (entry) {
+      el.innerHTML = `
+        <div class="panel-block identity">
+          <h2>建筑检查器 · 已删除文件</h2>
+          <code>${entry.id}</code>
+          <span>${entry.district || '—'} · 当前快照中已不存在，仅列出基线快照的旧指标</span>
+        </div>
+        <div class="panel-block"><div class="stat-grid">
+          <div><span>旧总行数</span><strong>${formatNumber(entry.loc.old ?? 0)}</strong></div>
+          <div><span>旧符号数</span><strong>${formatNumber(entry.symbols.old ?? 0)}</strong></div>
+          <div><span>旧被依赖</span><strong>${formatNumber(entry.fanIn.old ?? 0)}</strong></div>
+          <div><span>变化</span><strong><i class="d-dot" style="background:${diffColor('removed')}"></i>${CHANGE_LABELS.removed}</strong></div>
+        </div></div>
+        <div class="panel-block"><p class="note">该文件存在于基线快照、在当前快照中被删除：3D 里用红色影板占位（所属街区没有空网格时不做 3D 表达）。</p></div>
+        ${compareBoardsHtml()}`;
+      bindInspector();
+      return;
+    }
+  }
   if (state.interior) {
     const file = index.filesById.get(state.interior);
     const symbols = orderSymbols(file.symbols);
@@ -274,7 +336,9 @@ function renderInspector() {
         </button>
       </div>
       ${edgeList('它依赖（imports）', out, '没有解析到内部依赖。')}
-      ${edgeList('谁依赖它（imported by）', incoming, '没有同根文件引用它。')}`;
+      ${edgeList('谁依赖它（imported by）', incoming, '没有同根文件引用它。')}
+      ${fileDiffHtml(file.id)}
+      ${compareBoardsHtml()}`;
     bindInspector();
     return;
   }
@@ -301,7 +365,9 @@ function renderInspector() {
       ${district.subs?.length ? `<div class="panel-block"><h2>二级目录</h2><div class="list">${district.subs.map(sub => `<span class="note">${sub.name} · ${sub.fileCount} 文件 · ${formatNumber(sub.loc)} 行</span>`).join('')}</div></div>` : ''}
       ${edgeList('依赖的街区', out, '没有跨街区依赖。')}
       ${edgeList('被哪些街区依赖', incoming, '没有其他街区依赖它。')}
-      ${edgeList('最大的文件（点击进入）', biggest, '该街区没有文件。')}`;
+      ${edgeList('最大的文件（点击进入）', biggest, '该街区没有文件。')}
+      ${districtDiffHtml(district.id)}
+      ${compareBoardsHtml()}`;
     bindInspector();
     return;
   }
@@ -317,13 +383,73 @@ function renderInspector() {
       <div><span>函数 / 方法</span><strong>${formatNumber(graph.meta.defTotal)}</strong></div>
       <div><span>类</span><strong>${formatNumber(graph.meta.classTotal)}</strong></div>
     </div></div>
-    ${edgeList('最大的文件（点击进入）', top, '暂无数据。')}`;
+    ${edgeList('最大的文件（点击进入）', top, '暂无数据。')}
+    ${compareBoardsHtml()}`;
   bindInspector();
+}
+
+// 变化量的符号化展示与配色类名（供统计区与检查器复用）。
+function signedDelta(value) {
+  return value === 0 ? '±0' : `${value > 0 ? '+' : ''}${formatNumber(value)}`;
+}
+
+function deltaClass(value) {
+  return value > 0 ? 'd-up' : value < 0 ? 'd-down' : 'd-flat';
+}
+
+// 文件检查器里的“版本对比”块：旧值 / 新值 / Δ 与变化类别。
+function fileDiffHtml(fileId) {
+  if (!state.compare || !diff) return '';
+  const entry = diff.entries.get(fileId);
+  if (!entry) return '';
+  const rows = [['loc', '总行数'], ['symbols', '符号数'], ['fanIn', '被依赖']]
+    .map(([key, label]) => {
+      const meter = entry[key];
+      return `<div><span>${label}</span><strong>${meter.old ?? '—'} → ${meter.new ?? '—'} <i class="${deltaClass(meter.delta)}">${signedDelta(meter.delta)}</i></strong></div>`;
+    }).join('');
+  return `<div class="panel-block diff-block">
+    <h2>版本对比 · <i class="d-dot" style="background:${diffColor(entry.change)}"></i>${CHANGE_LABELS[entry.change]}</h2>
+    <div class="stat-grid">${rows}</div>
+  </div>`;
+}
+
+// 街区检查器里的“版本对比”块：本街区的四类变化计数。
+function districtDiffHtml(districtId) {
+  if (!state.compare || !diff) return '';
+  const counts = summarizeDistrict(diff, districtId);
+  const parts = ['added', 'removed', 'grown', 'shrunk'].map(change =>
+    `<div><span>${CHANGE_LABELS[change]}</span><strong><i class="d-dot" style="background:${diffColor(change)}"></i>${formatNumber(counts[change])}</strong></div>`).join('');
+  return `<div class="panel-block diff-block"><h2>版本对比 · 本街区</h2><div class="stat-grid">${parts}</div></div>`;
+}
+
+// 右侧的四个变化榜单：增长最多 / 缩小最多 / 新增 / 删除，各取前 8 条。
+function compareBoardsHtml() {
+  if (!state.compare || !diff) return '';
+  const changeMeta = entry => {
+    if (entry.loc.delta !== 0) return `${entry.loc.delta > 0 ? '+' : ''}${formatNumber(entry.loc.delta)} 行`;
+    if (entry.symbols.delta !== 0) return `${entry.symbols.delta > 0 ? '+' : ''}${entry.symbols.delta} 符号`;
+    return `${entry.fanIn.delta > 0 ? '+' : ''}${entry.fanIn.delta} 被依赖`;
+  };
+  const board = (title, entries, meta) => {
+    const rows = entries.length
+      ? entries.map(entry => `<button data-${entry.change === 'removed' ? 'removed-file' : 'file'}="${escapeAttr(entry.id)}">
+          <span class="dot" style="background:${diffColor(entry.change)}"></span>
+          <span class="path">${entry.id}</span>
+          <span class="meta">${meta(entry)}</span>
+        </button>`).join('')
+      : '<span class="note">这一类没有变化。</span>';
+    return `<div class="panel-block"><h2>${title}</h2><div class="list scroll">${rows}</div></div>`;
+  };
+  return board('增长最多', diff.boards.grown, changeMeta)
+    + board('缩小最多', diff.boards.shrunk, changeMeta)
+    + board('新增文件', diff.boards.added, entry => `${formatNumber(entry.loc.new || 0)} 行`)
+    + board('删除文件', diff.boards.removed, entry => `旧 ${formatNumber(entry.loc.old || 0)} 行`);
 }
 
 function bindInspector(scope = document.querySelector('#inspector')) {
   scope.querySelectorAll('[data-district]').forEach(node => node.addEventListener('click', () => selectNode({ kind: 'district', id: node.dataset.district })));
   scope.querySelectorAll('[data-file]').forEach(node => node.addEventListener('click', () => selectNode({ kind: 'file', id: node.dataset.file })));
+  scope.querySelectorAll('[data-removed-file]').forEach(node => node.addEventListener('click', () => showRemovedFile(node.dataset.removedFile)));
   scope.querySelectorAll('[data-symbol]').forEach(node => node.addEventListener('click', () => selectSymbol(node.dataset.symbol)));
   scope.querySelectorAll('[data-enter-interior]').forEach(node => node.addEventListener('click', () => enterInterior(node.dataset.enterInterior)));
   scope.querySelectorAll('[data-action="city"]').forEach(node => node.addEventListener('click', () => exitInterior()));
@@ -349,6 +475,12 @@ function renderStory() {
 }
 
 function renderCrumbs() {
+  const removedEntry = state.removed ? diff?.entries.get(state.removed) : null;
+  if (removedEntry) {
+    document.querySelector('#stage-title').textContent = `${removedEntry.id.split('/').pop()} · 已删除`;
+    document.querySelector('#stage-subtitle').textContent = `基线快照中 ${formatNumber(removedEntry.loc.old ?? 0)} 行 · 当前快照已不存在`;
+    return;
+  }
   const file = state.interior ? index.filesById.get(state.interior) : null;
   const title = file
     ? `${state.interior.split('/').pop()} · 内部`
@@ -387,6 +519,7 @@ function selectNode({ kind, id }, options = {}) {
   if (kind === 'symbol') { selectSymbol(id); return; }
   // 已选中同一栋建筑时再次点击，等价于下钻到文件内部。
   if (options.toggle && kind === 'file' && id === state.file && state.interior !== id) { enterInterior(id); return; }
+  state.removed = null;
   leaveInterior();
   if (kind === 'district') {
     if (!index.districtById.has(id)) return;
@@ -406,6 +539,72 @@ function selectNode({ kind, id }, options = {}) {
   renderInspector();
   renderCrumbs();
   updateHash();
+}
+
+// 点击 removed 榜单条目或它的影子底板：只展示旧指标，不动 3D 选中与镜头。
+function showRemovedFile(id) {
+  if (!index || !diff || !diff.entries.has(id)) return;
+  state.removed = id;
+  renderInspector();
+  renderCrumbs();
+  notify(`${id} 在当前快照中已被删除，仅显示基线快照的旧指标。`);
+}
+
+// ---- 版本对比：按需加载基线并切换差异着色 ----
+async function toggleCompare() {
+  if (state.compare) { setCompare(false); return; }
+  if (!diff) {
+    if (!baselineAvailable) {
+      await probeBaseline();
+      if (!baselineAvailable) { notify('需要先生成 public/graph.previous.json，才能启用版本对比。'); return; }
+    }
+    const button = document.querySelector('[data-action="compare"]');
+    button.disabled = true;
+    try {
+      const response = await fetch(`${import.meta.env.BASE_URL}graph.previous.json`);
+      if (!response.ok) throw new Error(`HTTP ${response.status}`);
+      diff = buildDiff(graph, await response.json());
+      if (!diff) throw new Error('基线 schema 与当前快照不一致');
+    } catch (error) {
+      diff = null;
+      baselineAvailable = false;
+      notify(`基线快照加载失败（${error.message}）。请先生成 public/graph.previous.json。`);
+      updateCompareButton();
+      return;
+    }
+  }
+  setCompare(true);
+}
+
+function setCompare(on) {
+  state.compare = !!on;
+  if (!state.compare) state.removed = null;
+  scene.setDiff(state.compare ? diff : null);
+  const button = document.querySelector('[data-action="compare"]');
+  button.classList.toggle('active', state.compare);
+  updateCompareButton();
+  renderHeaderStats();
+  renderLegend();
+  renderInspector();
+  if (state.compare) {
+    const { counts } = diff.stats;
+    notify(`版本对比已开启：${counts.grown} 个文件增长、${counts.shrunk} 个缩小、${counts.added} 个新增、${counts.removed} 个删除。`);
+  } else {
+    notify('已关闭版本对比，颜色恢复为普通着色。');
+  }
+}
+
+// 按钮可用性：基线缺失时只做视觉提示而不禁用，因为禁用会让点击事件直接失效，
+// 用户就无法触发 toggleCompare 里的"重新探测 + 明确提示"兜底路径。
+function updateCompareButton() {
+  const button = document.querySelector('[data-action="compare"]');
+  if (!button) return;
+  const unavailable = !state.compare && !baselineAvailable;
+  button.disabled = false;   // 复位加载过程中设置的临时禁用，否则加载失败后会永久锁死
+  button.classList.toggle('is-unavailable', unavailable);
+  button.title = unavailable
+    ? '需要先生成 public/graph.previous.json 才能启用版本对比（点击可重试探测）'
+    : '对比当前快照与基线快照 public/graph.previous.json';
 }
 
 // ---- 内部视图：状态与场景同步 ----
@@ -479,6 +678,7 @@ function updateCityButton() {
 
 function showOverview() {
   leaveInterior();
+  state.removed = null;
   state.district = null;
   state.file = null;
   scene.setSelection(null);
@@ -589,6 +789,7 @@ function wireEvents() {
       notify(state.colorMode === 'heat' ? '按被依赖程度着色：越暖表示被同根文件 import 得越多。' : '按街区着色。');
     }
     if (action === 'story') setStory(!state.story);
+    if (action === 'compare') toggleCompare();
     if (action === 'fullscreen') toggleFullscreen();
     if (action === 'zoom-in') scene.zoom(1);
     if (action === 'zoom-out') scene.zoom(-1);
