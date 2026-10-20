@@ -560,6 +560,7 @@ async function toggleCompare() {
     }
     const button = document.querySelector('[data-action="compare"]');
     button.disabled = true;
+    button.textContent = '版本对比 · 加载中…';   // 基线约 6.5 MB，给个加载反馈，避免中途以为没反应
     try {
       const response = await fetch(`${import.meta.env.BASE_URL}graph.previous.json`);
       if (!response.ok) throw new Error(`HTTP ${response.status}`);
@@ -571,6 +572,8 @@ async function toggleCompare() {
       notify(`基线快照加载失败（${error.message}）。请先生成 public/graph.previous.json。`);
       updateCompareButton();
       return;
+    } finally {
+      button.textContent = '版本对比';
     }
   }
   setCompare(true);
