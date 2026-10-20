@@ -1,0 +1,61 @@
+name: Deploy to GitHub Pages
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: pages
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Run pure-logic tests
+        run: npm test
+
+      # configure-pages 给出项目页子路径（如 /infar_code_prism），
+      # 传给 build 的 --base；前端用 import.meta.env.BASE_URL 读取 graph.json，两者保持一致。
+      - name: Configure Pages
+        id: pages
+        uses: actions/configure-pages@v5
+        with:
+          enablement: true
+
+      - name: Build static site
+        run: npm run build -- --base="${{ steps.pages.outputs.base_path }}/"
+
+      - name: Upload artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: dist
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4
