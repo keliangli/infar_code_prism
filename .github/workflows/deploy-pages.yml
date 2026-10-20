@@ -33,16 +33,13 @@ jobs:
       - name: Run pure-logic tests
         run: npm test
 
-      # configure-pages 给出项目页子路径（如 /infar_code_prism），
-      # 传给 build 的 --base；前端用 import.meta.env.BASE_URL 读取 graph.json，两者保持一致。
-      - name: Configure Pages
-        id: pages
-        uses: actions/configure-pages@v5
-        with:
-          enablement: true
-
+      # 这里刻意不使用 actions/configure-pages：
+      # 它需要先通过 Pages API 读取（未启用时会报 “Get Pages site failed: Not Found”），
+      # 而 GITHUB_TOKEN 也无权自动创建 Pages 站点。子路径直接写死，
+      # 使构建与上传阶段不依赖 Pages 是否已启用；只有 deploy 阶段需要 Pages 已开启。
+      # 前端用 import.meta.env.BASE_URL 读取 graph.json，与此处 base 保持一致。
       - name: Build static site
-        run: npm run build -- --base="${{ steps.pages.outputs.base_path }}/"
+        run: npm run build -- --base=/infar_code_prism/
 
       - name: Upload artifact
         uses: actions/upload-pages-artifact@v3
